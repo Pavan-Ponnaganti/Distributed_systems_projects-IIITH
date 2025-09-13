@@ -19,15 +19,16 @@ The pipeline follows a classic MapReduce structure:
 
 ## 📁 File Structure
 
-├── knn_main.py # Main driver script 
-├── map.py # Setup and mapper functions 
-├── shuffle.py # Shuffler logic using MPI alltoall
-├── reduce.py # Reducer and result gathering 
-├── output.py # Final output and timing logs 
-├── run_knn_mpr.sh # SLURM job script for scaling experiments 
-├── auto_run_knn.sh # Interactive launcher with input prompts 
-├── data/ # Contains points.csv and queries.csv 
-├── output/ # Stores results and timings
+```text
+├── knn_main.py         # Main driver script
+├── map.py              # Setup and mapper functions
+├── shuffle.py          # Shuffler logic using MPI alltoall
+├── reduce.py           # Reducer and result gathering
+├── output.py           # Final output and timing logs
+├── run_knn_mpr.sh      # SLURM job script for scaling experiments
+├── auto_run_knn.sh     # Interactive launcher with input prompts
+├── data/               # Contains points.csv and queries.csv
+├── output/             # Stores results and timings
 
 
 ---

@@ -16,7 +16,7 @@ print("--- Starting Detailed Workload Experiment ---")
 print(f"Will write results to {RESULTS_FILE}")
 
 # Create header for the CSV file
-csv_headers = ["n", "machine_id", "round", "workload"]
+csv_headers = ["n", "machine_id", "round_type", "round_num", "workload"]
 
 with open(RESULTS_FILE, 'w', newline='') as f:
     writer = csv.writer(f)
@@ -38,34 +38,38 @@ with open(RESULTS_FILE, 'w', newline='') as f:
         duration = time.time() - start_time
         print(f"Finished in {duration:.2f} seconds.")
 
-        # --- Parse the output to find our special result line ---
-        found_result = False
-        for line in result.stdout.splitlines():
-            if "---FINAL_RESULT---" in line:
-                # Line: "---FINAL_RESULT---,n=1000,m0_r1=50,m0_r2=20,m1_r1=48,..."
-                parts = line.split(',')
-                
-                n_val = int(parts[1].split('=')[1])
-                
-                # Parse all other key-value pairs
-                for part in parts[2:]:
-                    # key = "m0_r1", val = "50"
-                    key, val = part.split('=')
-                    workload = int(val)
-                    
-                    # key_parts = ["m0", "r1"]
-                    key_parts = key.split('_')
-                    machine_id = int(key_parts[0][1:]) # "m0" -> 0
-                    round_num = int(key_parts[1][1:])  # "r1" -> 1
-                    
-                    # Write one row in the CSV for this data point
-                    writer.writerow([n_val, machine_id, round_num, workload])
-                
-                print(f"Saved results for n={n_val}.")
-                found_result = True
-                break
+        # --- Parse the output to find our data lines ---
+        found_data = False
+        in_results_block = False
         
-        if not found_result:
-            print(f"ERROR: Could not find '---FINAL_RESULT---' in output for n={n}.")
+        for line in result.stdout.splitlines():
+            if "---FINAL_RESULT_START---" in line:
+                in_results_block = True
+                continue
+            if "---FINAL_RESULT_END---" in line:
+                in_results_block = False
+                print(f"Saved results for n={n}.")
+                break
+                
+            if in_results_block and "---DATA_POINT---" in line:
+                # Line: "---DATA_POINT---,1000,0,parallel,1,50"
+                # Line: "---DATA_POINT---,1000,0,final_solve,1,10"
+                parts = line.split(',')
+                n_val = int(parts[1])
+                machine_id = int(parts[2])
+                round_type = parts[3]
+                round_num = int(parts[4])
+                workload = int(parts[5])
+                
+                # Write the row in the CSV
+                writer.writerow([n_val, machine_id, round_type, round_num, workload])
+                found_data = True
+        
+        if not found_data:
+            print(f"ERROR: Could not find '---DATA_POINT---' lines in output for n={n}.")
+            print("--- STDOUT ---")
+            print(result.stdout)
+            print("--- STDERR ---")
+            print(result.stderr)
 
 print("\n--- Experiment Complete ---")

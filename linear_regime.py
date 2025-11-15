@@ -141,7 +141,6 @@ def main():
     
     iteration = 1
     while True:
-        # All processes get the current delta to decide if loop continues
         delta_current = comm.bcast(delta_current, root=0)
         
         if delta_current <= 2:
@@ -150,16 +149,10 @@ def main():
         if rank == 0:
             print(f"[Master] --- Iteration {iteration} (Delta = {delta_current}) ---")
             
-        # --- 1. Call Algorithm 1 (Parallel) ---
-        # ALL processes MUST enter this function
-        # M_parallel is only set on Rank 0
-        # my_round_workload is set on ALL ranks
         M_parallel, my_round_workload = run_parallel_algorithm_1_iteration(comm, all_nodes, all_edges, delta_current)
         
-        # --- NEW: All processes record their workload for this round ---
         my_workloads_per_round.append(my_round_workload)
         
-        # --- The rest of the loop is CENTRALIZED (Rank 0 only) ---
         if rank == 0:
             G_res_1, _ = get_residual_graph(G_current, M_parallel)
             
@@ -180,16 +173,13 @@ def main():
             M_round = M_parallel.union(M_prime).union(M_double_prime)
             Total_Matching.update(M_round)
             
-            # --- Master prepares graph data for the *next* iteration ---
             G_current, delta_current = get_residual_graph(G_res_2, M_double_prime)
             all_nodes = list(G_current.nodes())
             all_edges = list(G_current.edges())
             iteration += 1
         
-        # --- NEW: Master must bcast new graph info to workers ---
-        # (This is needed so workers have the right all_edges for the *next* round)
+        # --- Bcast new graph info to workers for next round ---
         if rank != 0:
-             # Workers need placeholders for the bcast
              all_nodes = None
              all_edges = None
         all_nodes = comm.bcast(all_nodes, root=0)
@@ -198,25 +188,32 @@ def main():
 
     # --- Final Centralized Step (The O(n) Bottleneck) ---
     if rank == 0:
+        # --- NEW: Get the workload for the final solve ---
+        final_solve_workload = G_current.number_of_edges()
         M_final = nx.maximal_matching(G_current)
         Total_Matching.update(M_final)
+    else:
+        final_solve_workload = 0 # Not applicable to other ranks
 
     # --- NEW: Final Report ---
-    # All processes send their workload history to the master
     all_workload_data = comm.gather(my_workloads_per_round, root=0)
     
     if rank == 0:
-        # Master now has a list of lists:
-        # e.g., [[m0_r1, m0_r2], [m1_r1, m1_r2], ...]
+        # This is a signal that this 'n' is complete
+        print(f"---FINAL_RESULT_START---,n={N_NODES}")
         
-        # This print line is specifically formatted for the
-        # orchestrator script to read.
-        result_str = f"---FINAL_RESULT---,n={N_NODES}"
+        # Print parallel workloads
         for machine_id in range(size):
             for round_num in range(len(all_workload_data[machine_id])):
                 workload = all_workload_data[machine_id][round_num]
-                result_str += f",m{machine_id}_r{round_num+1}={workload}"
-        print(result_str)
+                # Format: n, machine_id, round_type, round_num, workload
+                print(f"---DATA_POINT---,{N_NODES},{machine_id},parallel,{round_num+1},{workload}")
+        
+        # Print final solve workload
+        # Format: n, machine_id, round_type, round_num, workload
+        print(f"---DATA_POINT---,{N_NODES},0,final_solve,1,{final_solve_workload}")
+        
+        print("---FINAL_RESULT_END---") # Signal end of data
 
 if __name__ == "__main__":
     main()

@@ -5,8 +5,9 @@ import time
 from mpi4py import MPI
 import argparse
 
-# --- Helper Functions (no changes) ---
+# --- Helper Functions ---
 def generate_graph_data(n, m_edges):
+    """ (This runs only on the master process) """
     print(f"[Master] Generating graph with {n} nodes...")
     G = nx.barabasi_albert_graph(n, m_edges, seed=42)
     all_nodes = list(G.nodes())
@@ -17,6 +18,7 @@ def generate_graph_data(n, m_edges):
     return G, all_nodes, all_edges, delta
 
 def create_arbitrary_chunks(all_edges, num_chunks):
+    """ (This runs only on the master process) """
     random.shuffle(all_edges)
     chunk_size = len(all_edges) // num_chunks
     chunks = [all_edges[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
@@ -25,95 +27,29 @@ def create_arbitrary_chunks(all_edges, num_chunks):
         chunks[i].append(all_edges[-(i + 1)])
     return chunks
 
-# --- Algorithm 1 Function (MODIFIED to return workload) ---
-def run_parallel_algorithm_1_iteration(comm, all_nodes, all_edges, delta):
-    """
-    Runs one full parallel iteration of Algorithm 1.
-    All processes must enter this function.
-    Returns:
-    - (Rank 0): (M_Algorithm1, my_workload)
-    - (Others): (None, my_workload)
-    """
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    
-    if rank == 0:
-        k = size
-        p = math.pow(delta, -0.77)
-        vertex_map = {node: random.randint(0, k - 1) for node in all_nodes}
-        global_edge_order = all_edges[:]
-        random.shuffle(global_edge_order)
-        arbitrary_edge_chunks = create_arbitrary_chunks(all_edges, size)
-        params_to_bcast = {
-            'p': p,
-            'vertex_map': vertex_map,
-            'global_edge_order': global_edge_order
-        }
-    else:
-        arbitrary_edge_chunks = None
-        params_to_bcast = None
-
-    local_edges = comm.scatter(arbitrary_edge_chunks, root=0)
-    params = comm.bcast(params_to_bcast, root=0)
-    p = params['p']
-    vertex_map = params['vertex_map']
-    global_edge_order = params['global_edge_order']
-    sampled_local_edges = [edge for edge in local_edges if random.random() <= p]
-
-    send_buckets = [[] for _ in range(size)]
-    for u, v in sampled_local_edges:
-        if u not in vertex_map or v not in vertex_map:
-            continue
-        owner_u = vertex_map[u]
-        owner_v = vertex_map[v]
-        if owner_u == owner_v:
-            send_buckets[owner_u].append((u, v))
-    
-    received_buckets = comm.alltoall(send_buckets)
-    my_subgraph_edges = [edge for bucket in received_buckets for edge in bucket]
-    
-    # --- THIS IS THE METRIC ---
-    my_workload = len(my_subgraph_edges) # Measured by ALL processes
-
-    local_matching = set()
-    matched_nodes = set()
-    subgraph_edge_set = set(my_subgraph_edges)
-    for u, v in global_edge_order:
-        if (u, v) in subgraph_edge_set:
-            if u not in matched_nodes and v not in matched_nodes:
-                local_matching.add((u, v))
-                matched_nodes.add(u)
-                matched_nodes.add(v)
-    
-    all_local_matchings = comm.gather(local_matching, root=0)
-    
-    if rank == 0:
-        M_Algorithm1 = set()
-        for local_set in all_local_matchings:
-            M_Algorithm1.update(local_set)
-        return M_Algorithm1, my_workload
-    else:
-        return None, my_workload # Others return their workload
-
-# --- Helper for residual graph (no changes) ---
-def get_residual_graph(G, matching):
+# --- NEW: Helper to remove matched nodes/edges from a *local* edge list ---
+def get_local_residual_edges(local_edges, matching):
     nodes_to_remove = set()
     for u, v in matching:
         nodes_to_remove.add(u)
         nodes_to_remove.add(v)
     
-    G_res = G.copy()
-    G_res.remove_nodes_from(nodes_to_remove)
-    
-    new_delta = 0
-    if G_res.nodes():
-        degrees = [d for n, d in G_res.degree()]
-        if degrees:
-            new_delta = max(degrees)
-            
-    return G_res, new_delta
+    # Return edges where neither endpoint was matched
+    return [
+        (u, v) for u, v in local_edges 
+        if u not in nodes_to_remove and v not in nodes_to_remove
+    ]
 
-# --- Main "Master Loop" (Modified for detailed workload experiment) ---
+# --- NEW: Helper to get local max degree ---
+def get_local_max_degree(local_edges, local_nodes):
+    degrees = {node: 0 for node in local_nodes}
+    for u, v in local_edges:
+        if u in degrees: degrees[u] += 1
+        if v in degrees: degrees[v] += 1
+    
+    return max(degrees.values()) if degrees else 0
+
+# --- Main "True Linear" Algorithm ---
 def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -126,94 +62,236 @@ def main():
     N_NODES = args.n
     M_EDGES_PER_NODE = args.m
 
-    # --- NEW: All processes track their own workload per round ---
-    my_workloads_per_round = []
-
-    # --- Variables for the main loop ---
-    G_current = None
-    all_nodes = None
-    all_edges = None
-    delta_current = 0
-    Total_Matching = set()
+    # --- NEW: All processes track their own data ---
+    my_workloads_per_round = [] # Tracks parallel workload
+    my_nodes = []              # Nodes this process "owns"
+    my_edges = []              # Edges this process "owns" (the true residual graph)
+    Total_Matching = set()     # Only Rank 0 will store the final matching
     
+    # --- 1. Master Process (Rank 0) Setup ---
     if rank == 0:
-        G_current, all_nodes, all_edges, delta_current = generate_graph_data(N_NODES, M_EDGES_PER_NODE)
+        G, all_nodes, all_edges, delta_current = generate_graph_data(N_NODES, M_EDGES_PER_NODE)
+        k = size
+        
+        # --- Create Vertex Map & Hash Seed ---
+        vertex_map = {node: random.randint(0, k - 1) for node in all_nodes}
+        hash_seed = random.randint(0, 2**32 - 1)
+        
+        # --- Create arbitrary chunks for initial scatter ---
+        arbitrary_edge_chunks = create_arbitrary_chunks(all_edges, size)
+        
+        params_to_bcast = {
+            'vertex_map': vertex_map,
+            'hash_seed': hash_seed
+        }
+        
+    else:
+        # Workers have no data yet
+        arbitrary_edge_chunks = None
+        params_to_bcast = None
+        all_nodes = None
+        delta_current = 0
+
+    # --- 2. Initial State: Scatter & Broadcast ---
+    local_arbitrary_edges = comm.scatter(arbitrary_edge_chunks, root=0)
+    params = comm.bcast(params_to_bcast, root=0)
+    vertex_map = params['vertex_map']
+    hash_seed = params['hash_seed']
+    
+    # --- 3. Initial Shuffle (to establish the "true" distributed graph) ---
+    # This is like Algorithm 1, but without sampling (p=1)
+    send_buckets = [[] for _ in range(size)]
+    for u, v in local_arbitrary_edges:
+        if u not in vertex_map or v not in vertex_map: continue
+        owner_u = vertex_map[u]
+        owner_v = vertex_map[v]
+        # Distribute based on owner of first node
+        # This is a standard graph distribution method
+        send_buckets[owner_u].append((u, v)) 
+        
+    received_buckets = comm.alltoall(send_buckets)
+    my_edges = [edge for bucket in received_buckets for edge in bucket] # Our local residual graph
+    my_nodes = [node for node, owner in vertex_map.items() if owner == rank]
     
     iteration = 1
     while True:
-        delta_current = comm.bcast(delta_current, root=0)
+        # --- 0. Calculate Current Delta (Distributed) ---
+        local_max_deg = get_local_max_degree(my_edges, my_nodes)
+        delta_current = comm.allreduce(local_max_deg, op=MPI.MAX)
         
+        if rank == 0:
+            print(f"\n[Master] --- Starting Iteration {iteration} (Global Delta = {delta_current}) ---")
+            
         if delta_current <= 2:
             break
             
-        if rank == 0:
-            print(f"[Master] --- Iteration {iteration} (Delta = {delta_current}) ---")
-            
-        M_parallel, my_round_workload = run_parallel_algorithm_1_iteration(comm, all_nodes, all_edges, delta_current)
+        # --- 1. Run Parallel Algorithm 1 ---
+        # This is the core parallel algorithm, now fully distributed
         
+        # A. Calculate parameters and bcast
+        if rank == 0:
+            p = math.pow(delta_current, -0.77)
+            q = math.pow(delta_current, -0.91)
+            threshold = math.pow(delta_current, 0.92)
+            round_params = {'p': p, 'q': q, 'threshold': threshold}
+        else:
+            round_params = None
+            
+        round_params = comm.bcast(round_params, root=0)
+        p = round_params['p']
+        q = round_params['q']
+        threshold = round_params['threshold']
+        
+        # B. Local Sampling (for Algorithm 1)
+        sampled_local_edges = [edge for edge in my_edges if random.random() <= p]
+        
+        # C. The "Shuffle" for G^L[Vi]
+        send_buckets = [[] for _ in range(size)]
+        for u, v in sampled_local_edges:
+            owner_u = vertex_map[u]
+            owner_v = vertex_map[v]
+            if owner_u == owner_v:
+                send_buckets[owner_u].append((u, v))
+                
+        received_buckets = comm.alltoall(send_buckets)
+        my_subgraph_edges = [edge for bucket in received_buckets for edge in bucket]
+        
+        # --- NEW: Record Workload ---
+        # This is the workload for the parallel part
+        my_round_workload = len(my_subgraph_edges)
         my_workloads_per_round.append(my_round_workload)
         
+        # D. Parallel Greedy Matching (Hash-based)
+        local_matching = set()
+        matched_nodes = set()
+        prioritized_edges = []
+        for u, v in my_subgraph_edges:
+            edge_tuple = tuple(sorted((u, v)))
+            priority = hash((hash_seed, iteration, edge_tuple)) # Add iteration to seed
+            prioritized_edges.append((priority, (u, v)))
+        prioritized_edges.sort()
+        for priority, (u, v) in prioritized_edges:
+            if u not in matched_nodes and v not in matched_nodes:
+                local_matching.add((u, v))
+                matched_nodes.add(u)
+                matched_nodes.add(v)
+        
+        # E. Gather M_parallel to Rank 0
+        all_local_matchings = comm.gather(local_matching, root=0)
+        
         if rank == 0:
-            G_res_1, _ = get_residual_graph(G_current, M_parallel)
+            M_parallel = set()
+            for local_set in all_local_matchings:
+                M_parallel.update(local_set)
+            print(f"[Master] Iteration {iteration}: M_parallel found {len(M_parallel)} edges.")
+        else:
+            M_parallel = None
             
-            q = math.pow(delta_current, -0.91)
-            G_prime_edges = [e for e in G_res_1.edges() if random.random() <= q]
-            G_prime = nx.Graph(G_prime_edges)
+        # Bcast M_parallel so all processes can update their residual graph
+        M_parallel = comm.bcast(M_parallel, root=0)
+        
+        # ALL processes update their local residual graph
+        my_edges = get_local_residual_edges(my_edges, M_parallel)
+        
+        # --- 2. Centralized Clean-up M' (Parallel Sampling) ---
+        # G_res_1 is now distributed as `my_edges`
+        
+        # A. All processes sample their local edges for G'
+        local_g_prime_edges = [edge for edge in my_edges if random.random() <= q]
+        
+        # B. Gather all G' edges to Rank 0
+        all_g_prime_chunks = comm.gather(local_g_prime_edges, root=0)
+        
+        # C. Rank 0 solves M' (This is OK, G' is tiny: O(n/Delta^0.01))
+        if rank == 0:
+            g_prime_edges = [edge for chunk in all_g_prime_chunks for edge in chunk]
+            G_prime = nx.Graph(g_prime_edges)
             M_prime = nx.maximal_matching(G_prime)
+            print(f"[Master] Iteration {iteration}: M_prime found {len(M_prime)} edges.")
+        else:
+            M_prime = None
             
-            G_res_2, _ = get_residual_graph(G_res_1, M_prime)
+        # D. Bcast M' so all can update
+        M_prime = comm.bcast(M_prime, root=0)
+        my_edges = get_local_residual_edges(my_edges, M_prime)
+        
+        # --- 3. Centralized Clean-up M'' (Parallel Straggler Find) ---
+        # G_res_2 is now distributed as `my_edges`
+
+        # A. All processes find their *local* stragglers
+        my_local_max_deg = get_local_max_degree(my_edges, my_nodes)
+        
+        # B. Check if *any* process has a node above the threshold
+        global_max_deg = comm.allreduce(my_local_max_deg, op=MPI.MAX)
+        
+        if global_max_deg >= threshold:
+            # C. Find local straggler nodes U and their edges F
+            my_degrees = {node: 0 for node in my_nodes}
+            for u, v in my_edges:
+                if u in my_degrees: my_degrees[u] += 1
+                if v in my_degrees: my_degrees[v] += 1
             
-            threshold = math.pow(delta_current, 0.92)
-            nodes_to_check = list(G_res_2.nodes())
-            U = [n for n in nodes_to_check if G_res_2.degree(n) >= threshold]
+            my_straggler_nodes = {n for n, d in my_degrees.items() if d >= threshold}
+            my_straggler_edges = [
+                (u, v) for u, v in my_edges 
+                if u in my_straggler_nodes or v in my_straggler_nodes
+            ]
             
-            G_double_prime = G_res_2.subgraph(U)
-            M_double_prime = nx.maximal_matching(G_double_prime)
+            # D. Gather all straggler edges to Rank 0
+            all_straggler_chunks = comm.gather(my_straggler_edges, root=0)
             
+            # E. Rank 0 solves M'' (This is OK, G'' is tiny)
+            if rank == 0:
+                g_double_prime_edges = [edge for chunk in all_straggler_chunks for edge in chunk]
+                G_double_prime = nx.Graph(g_double_prime_edges)
+                M_double_prime = nx.maximal_matching(G_double_prime)
+                print(f"[Master] Iteration {iteration}: M'' found {len(M_double_prime)} edges.")
+            else:
+                M_double_prime = None
+                
+            # F. Bcast M''
+            M_double_prime = comm.bcast(M_double_prime, root=0)
+            my_edges = get_local_residual_edges(my_edges, M_double_prime)
+        else:
+            # No stragglers, M_double_prime is empty
+            M_double_prime = set()
+            if rank == 0:
+                print(f"[Master] Iteration {iteration}: M'' found 0 edges (no stragglers).")
+
+        # --- 4. Combine and prepare for next iteration ---
+        if rank == 0:
             M_round = M_parallel.union(M_prime).union(M_double_prime)
             Total_Matching.update(M_round)
             
-            G_current, delta_current = get_residual_graph(G_res_2, M_double_prime)
-            all_nodes = list(G_current.nodes())
-            all_edges = list(G_current.edges())
-            iteration += 1
-        
-        # --- Bcast new graph info to workers for next round ---
-        if rank != 0:
-             all_nodes = None
-             all_edges = None
-        all_nodes = comm.bcast(all_nodes, root=0)
-        all_edges = comm.bcast(all_edges, root=0)
-
+        iteration += 1
 
     # --- Final Centralized Step (The O(n) Bottleneck) ---
+    # The loop is over, delta <= 2. The *total* graph is sparse (O(n) edges).
+    # It is now *safe* to gather the full residual graph to Rank 0.
+    
+    all_final_edges = comm.gather(my_edges, root=0)
+    
     if rank == 0:
-        # --- NEW: Get the workload for the final solve ---
-        final_solve_workload = G_current.number_of_edges()
+        final_residual_edges = [edge for chunk in all_final_edges for edge in chunk]
+        final_solve_workload = len(final_residual_edges) # This is the final workload
+        
+        G_current = nx.Graph(final_residual_edges)
         M_final = nx.maximal_matching(G_current)
         Total_Matching.update(M_final)
     else:
         final_solve_workload = 0 # Not applicable to other ranks
 
-    # --- NEW: Final Report ---
+    # --- Final Report ---
     all_workload_data = comm.gather(my_workloads_per_round, root=0)
     
     if rank == 0:
-        # This is a signal that this 'n' is complete
         print(f"---FINAL_RESULT_START---,n={N_NODES}")
-        
-        # Print parallel workloads
         for machine_id in range(size):
             for round_num in range(len(all_workload_data[machine_id])):
                 workload = all_workload_data[machine_id][round_num]
-                # Format: n, machine_id, round_type, round_num, workload
                 print(f"---DATA_POINT---,{N_NODES},{machine_id},parallel,{round_num+1},{workload}")
-        
-        # Print final solve workload
-        # Format: n, machine_id, round_type, round_num, workload
         print(f"---DATA_POINT---,{N_NODES},0,final_solve,1,{final_solve_workload}")
-        
-        print("---FINAL_RESULT_END---") # Signal end of data
+        print("---FINAL_RESULT_END---")
 
 if __name__ == "__main__":
     main()

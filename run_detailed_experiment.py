@@ -9,7 +9,7 @@ SCRIPT_TO_RUN = "linear_regime.py"
 RESULTS_FILE = "detailed_workload_results.csv"
 
 # --- Define the graph sizes you want to test ---
-N_VALUES_TO_TEST = [1000, 5000, 10000, 20000, 40000, 80000, 120000, 160000]
+N_VALUES_TO_TEST = [1000, 5000, 10000, 20000, 40000, 60000, 80000, 100000, 120000, 140000, 160000]
 
 # --- Run the Experiment ---
 print("--- Starting Detailed Workload Experiment ---")
